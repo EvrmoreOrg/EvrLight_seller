@@ -1,4 +1,4 @@
-// version=a339f833
+// version=4785746a
 // Copyright (c) 2026 Hans Schmidt - All rights reserved
 const ws = require("websocket");
 
@@ -1375,6 +1375,7 @@ function decodeNsec(nsecStr) {
 
 async function resolveSellerIdKey(sellerIdKeyField) {
     var field = sellerIdKeyField;
+    if (typeof field === "number") process.exit(1);
     if (field === void 0 || field === "") {
         field = await promptTerminal("seller_id_key not set -- enter a 64-char hex key, an nsec1... key, or press enter for a random one: ");
         if (field === "") field = "random";
@@ -1909,6 +1910,52 @@ function resumeOpenLeases() {
     if (resumedCount > 0) ;
 }
 
+var HEARTBEAT_FILE = config.heartbeat_file || "seller-heartbeat.json";
+
+var HEARTBEAT_INTERVAL_MS = 30 * 1e3;
+
+var processStartedAt = (new Date).toISOString();
+
+function writeHeartbeatFile() {
+    var leaseCounts = {};
+    leases.forEach(function(lease) {
+        leaseCounts[lease.state] = (leaseCounts[lease.state] || 0) + 1;
+    });
+    var status = {
+        process: "seller",
+        pid: process.pid,
+        ts: (new Date).toISOString(),
+        started_at: processStartedAt,
+        uptime_s: Math.round(process.uptime()),
+        network: config.network,
+        nostr_pubkey: sellerNostrPubkey,
+        evr_address: sellerAddress,
+        asset_name: asset_name || null,
+        relays: relayConnections.map(function(conn) {
+            return {
+                url: conn.url,
+                connected: !!(conn.activeConnection && conn.activeConnection.connected)
+            };
+        }),
+        paired_swapservices: Array.from(pairedSwapservicePubkeys),
+        leases: leaseCounts,
+        halted_due_to_inconsistency: haltedDueToInconsistency,
+        memory_rss_mb: Math.round(process.memoryUsage().rss / 1048576)
+    };
+    var tmpPath = HEARTBEAT_FILE + ".tmp";
+    try {
+        fs.writeFileSync(tmpPath, JSON.stringify(status) + "\n");
+        fs.renameSync(tmpPath, HEARTBEAT_FILE);
+    } catch (e) {
+        e.message;
+    }
+}
+
+function startHeartbeatFile() {
+    writeHeartbeatFile();
+    setInterval(writeHeartbeatFile, HEARTBEAT_INTERVAL_MS);
+}
+
 async function startSeller() {
     loadPersistedState();
     sellerNostrPrivkey = await resolveSellerIdKey(config.seller_id_key);
@@ -1918,6 +1965,7 @@ async function startSeller() {
     startReconciliationLoop();
     reconnect();
     checkHeartbeat();
+    startHeartbeatFile();
 }
 
 if (require.main === module) startSeller();

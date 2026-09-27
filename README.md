@@ -50,14 +50,87 @@ In general, that is acceptable since merchants have more motivation and resource
 what is needed or to pay an expert to set it up. But I also expect hosted Lightning nodes
 and other simplifications to become available in the future.
 
-Be sure to set the required configuration parameters in seller.config.
-
 EvrLight is designed to be quite robust against a variety of errors, and will
 automatically unwind most transactions which encounter problems. It also maintains a few
 files such as active-seller-addresses.txt and seller-lease-state.json to help it avoid
 problems and to automaticaally recover funds at re-start in case of a software or hardware
 crash. Nevertheless, the computer on which seller.js and its Lightning node run should be
 as robust and secure as possible since they are live Evrmore and Bitcoin wallets.
+
+### <u>Installing the EvrLight seller module on your server:</u>
+
+seller.js is a headless NodeJS application. It is best to run it on an Ubuntu Linux server due
+to supporting scripts. It needs only NodeJS and git installed. Simply copy all the files to
+your server and run the command "cd path_to_seller && npm ci"
+
+Be sure to set the required configuration parameters in seller.config.
+Also note the environment variables which it requires (documented in the config file).
+
+To run: node seller.js
+
+
+### <u>If you want to use the included watchdog utility:</u>
+
+**Start `seller.js`** (first time: complete the setup checklist below):
+
+```
+cd /path/to/seller
+nohup ./seller_watchdog.sh >> seller_watchdog.out 2>&1 &
+```
+
+- Run it from the directory that holds `seller.js`. The watchdog changes to its own directory anyway, but
+  `seller_watchdog.out` is created relative to where you run the command, so `cd` there first.
+- `nohup ... &` keeps it running after you log out.
+- Within a few seconds `seller_watchdog.out` should show `started seller.js (pid ...)`. A `FATAL:` line
+  instead means a preflight check failed and nothing was started — the message says what to fix.
+
+**Check that it's running:**
+
+```
+pgrep -af seller_watchdog.sh        # the watchdog: "bash ./seller_watchdog.sh"
+pgrep -af "node seller.js"          # the seller itself
+cat seller-heartbeat.json           # its latest status; "ts" should be under ~30 seconds old
+tail -f seller.log                  # the seller's own output
+tail seller_watchdog.out            # the watchdog's messages
+cat watchdog_restarts.log           # every restart so far (the file only exists after the first one)
+```
+
+**Stop `seller.js`:** stop the watchdog, which stops the seller first.
+
+```
+pgrep -f seller_watchdog.sh         # prints the watchdog's pid
+kill <that pid>                     # SIGTERM
+```
+
+or in one step, if it was started as shown above:
+
+```
+pkill -TERM -f "bash ./seller_watchdog.sh"
+```
+
+- `kill` returns immediately, but stopping takes up to about 15 seconds (the seller gets `SIGTERM`, then
+  `SIGKILL` if it hasn't exited). `seller_watchdog.out` shows `stopped` when it's done.
+- Confirm nothing is left: `pgrep -af "node seller.js"` should print nothing.
+
+**Restart `seller.js`** (e.g. after changing `seller.config` or `seller.env`, which are only read at
+start): stop it as above, wait for `stopped`, then start it again.
+
+**Don't:**
+
+- **Kill the node process directly** (`kill <node pid>`). The watchdog sees the exit and starts it again
+  about 10 seconds later.
+- **Kill the watchdog with `kill -9`.** It can't stop the seller first, so the seller keeps running
+  unsupervised, and a new watchdog refuses to start until you stop that seller by hand
+  (`pkill -TERM -f "node seller.js"`, then check with `pgrep`).
+- **Start a second copy** of the watchdog or of `node seller.js` in the same directory. The watchdog
+  refuses both, but a copy in a *different* directory or on another machine isn't detected — see
+  "NOT HANDLED" below.
+
+**Start at boot** (without systemd), with a crontab line (`crontab -e`):
+
+```
+@reboot cd /path/to/seller && nohup ./seller_watchdog.sh >> seller_watchdog.out 2>&1 &
+```
 
 Lastly, you should be aware of the scripts recover-refund-key.js and release-lease.js,
 which can be helpful in unusual circumstances. Full documentation is at the top of 
