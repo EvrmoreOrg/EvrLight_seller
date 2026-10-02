@@ -1,4 +1,4 @@
-// version=4785746a
+// version=03d5f02e
 // Copyright (c) 2026 Hans Schmidt - All rights reserved
 const ws = require("websocket");
 
@@ -71,7 +71,12 @@ function resolveMacaroon(value) {
     return value;
 }
 
-var invoicemac = resolveMacaroon(config.invoicemac);
+if (!config.sellermac) {
+    config.invoicemac;
+    process.exit(1);
+}
+
+var sellermac = resolveMacaroon(config.sellermac);
 
 var lndendpoint = config.lndendpoint;
 
@@ -274,6 +279,37 @@ function evrmoreRpc(method, params, quiet) {
     });
 }
 
+function rpcNodeError(reply) {
+    var e = reply && reply.error;
+    if (e && typeof e === "object" && e.error && typeof e.error.code === "number") return e.error;
+    if (e && typeof e === "object" && typeof e.code === "number") return e;
+    return null;
+}
+
+async function rpcAnswer(method, params, quiet) {
+    var delaySeconds = 5;
+    while (true) {
+        var reply = await evrmoreRpc(method, params, quiet);
+        var nodeError = rpcNodeError(reply);
+        if (nodeError) return {
+            error: nodeError
+        };
+        if (reply && !reply.error && reply.result !== void 0) return {
+            result: reply.result
+        };
+        await new Promise(function(resolve) {
+            setTimeout(resolve, delaySeconds * 1e3);
+        });
+        delaySeconds = Math.min(delaySeconds * 2, 60);
+    }
+}
+
+async function rpcResult(method, params, quiet) {
+    var answer = await rpcAnswer(method, params, quiet);
+    if (answer.error) throw new Error("EVR RPC " + method + " failed: " + answer.error.message);
+    return answer.result;
+}
+
 async function getMinFeeRate() {
     var reply = await evrmoreRpc("estimatesmartfee", [ 1, "CONSERVATIVE" ]);
     if (!reply || !reply.result || !("feerate" in reply.result)) {
@@ -286,13 +322,11 @@ async function getMinFeeRate() {
 }
 
 async function getBlockheight() {
-    var reply = await evrmoreRpc("getblockcount", []);
-    return Number(reply.result);
+    return Number(await rpcResult("getblockcount", []));
 }
 
 async function getRawTxHex(txid) {
-    var reply = await evrmoreRpc("getrawtransaction", [ txid ]);
-    return reply.result;
+    return await rpcResult("getrawtransaction", [ txid ]);
 }
 
 function generateHtlc(serverPubkey, userPubkey, pmthash, timelock) {
@@ -527,10 +561,13 @@ function currentAggregateExposure() {
 var lastUtxoSnapshot = null;
 
 async function currentSellerUtxoSnapshot() {
-    var reply = await evrmoreRpc("getaddressutxos", [ {
+    var raw = await rpcResult("getaddressutxos", [ {
         addresses: [ sellerAddress ]
-    } ], true);
-    var raw = reply.result || [];
+    } ], true) || [];
+    raw = raw.concat(await rpcResult("getaddressutxos", [ {
+        addresses: [ sellerAddress ],
+        assetName: "*"
+    } ], true) || []);
     var snapshot = new Set;
     raw.forEach(function(u) {
         var tx_hash = u.tx_hash || u.txid;
@@ -549,7 +586,7 @@ async function reconcileLeases() {
         });
         newlySpent.forEach(function(outpoint) {
             var matchedLeaseId = null;
-            for (var [lease_id, lease] of leases) if (lease.state === "signed" && lease.utxos.some(function(u) {
+            for (var [lease_id, lease] of leases) if ((lease.state === "signed" || lease.state === "funded") && lease.utxos.some(function(u) {
                 return u.tx_hash + ":" + u.vout === outpoint;
             })) {
                 matchedLeaseId = lease_id;
@@ -557,8 +594,10 @@ async function reconcileLeases() {
             }
             if (matchedLeaseId) {
                 var matchedLease = leases.get(matchedLeaseId);
-                matchedLease.state = "funded";
-                matchedLease.funded_at = Date.now();
+                if (matchedLease.state === "signed") {
+                    matchedLease.state = "funded";
+                    matchedLease.funded_at = Date.now();
+                }
             } else haltedDueToInconsistency = true;
         });
     }
@@ -575,15 +614,36 @@ async function reconcileLeases() {
 
 var RECONCILE_INTERVAL_MS = 2 * 60 * 1e3;
 
+var reconcileInFlight = false;
+
 function startReconciliationLoop() {
     currentSellerUtxoSnapshot().then(function(snapshot) {
         lastUtxoSnapshot = snapshot;
+    }).catch(function(e) {
+        e.message;
     });
     setInterval(function() {
+        if (reconcileInFlight) return;
+        reconcileInFlight = true;
         reconcileLeases().catch(function(e) {
             e.message;
+        }).then(function() {
+            reconcileInFlight = false;
         });
     }, RECONCILE_INTERVAL_MS);
+}
+
+var LEASE_TIMELOCK_MIN_BLOCKS = 60;
+
+var LEASE_TIMELOCK_MAX_BLOCKS = 130;
+
+var MIN_COMPENSATION_INVOICE_CLTV = 40;
+
+var COMPENSATION_ROUNDING_TOLERANCE_LSATS = 2;
+
+function expectedCompensationLsats(lease) {
+    if (lease.asset_name) return Math.round(lease.asset_amount / 1e8 / rate_asset_per_btc * 1e8) + Math.round(lease.amount / 1e8 / rate_evr_per_btc * 1e8);
+    return Math.round(lease.amount / 1e8 / rate_evr_per_btc * 1e8);
 }
 
 async function leaseUtxos(req) {
@@ -592,6 +652,19 @@ async function leaseUtxos(req) {
     };
     if (!refundKeys.has(req.refund_pubkey)) return {
         error: "unrecognized refund_pubkey -- must be one this seller previously issued via get_refund_pubkey"
+    };
+    if ((req.asset_name || "") !== asset_name) return {
+        error: "this seller only sells " + (asset_name || "EVR") + ", not " + (req.asset_name || "EVR")
+    };
+    if (asset_name && Number(req.amount) !== Math.round(asset_evr_bundle_amount * 1e8)) return {
+        error: "EVR bundle amount " + req.amount + " doesn't match this seller's asset_evr_bundle_amount (" + asset_evr_bundle_amount + " EVR)"
+    };
+    if (!Number.isInteger(req.timelock)) return {
+        error: "timelock must be an integer block height"
+    };
+    var leaseHeight = await getBlockheight();
+    if (req.timelock < leaseHeight + LEASE_TIMELOCK_MIN_BLOCKS || req.timelock > leaseHeight + LEASE_TIMELOCK_MAX_BLOCKS) return {
+        error: "timelock " + req.timelock + " must be " + LEASE_TIMELOCK_MIN_BLOCKS + " to " + LEASE_TIMELOCK_MAX_BLOCKS + " blocks ahead of the current height (" + leaseHeight + ")"
     };
     if (!req.asset_name) {
         var amountEvr = Number(req.amount) / 1e8;
@@ -681,6 +754,9 @@ async function signPsbt(req) {
     if (compensationStatus !== "ACCEPTED") return {
         error: "compensation invoice not yet held (status: " + compensationStatus + ")",
         code: "compensation_not_held"
+    };
+    if (!(lease.holdInvoiceAmount >= expectedCompensationLsats(lease) - COMPENSATION_ROUNDING_TOLERANCE_LSATS)) return {
+        error: "the held compensation (" + lease.holdInvoiceAmount + " L-sats) is below this seller's price for the lease"
     };
     var psbt;
     try {
@@ -822,19 +898,46 @@ async function signPsbt(req) {
     };
 }
 
+async function getLndNodePubkey() {
+    let options = {
+        url: lndendpoint + "/v1/getinfo",
+        rejectUnauthorized: false,
+        json: true,
+        timeout: 15e3,
+        headers: {
+            "Grpc-Metadata-macaroon": sellermac
+        }
+    };
+    return new Promise(function(resolve) {
+        request.get(options, function(error, response, body) {
+            var pubkey = body && body["identity_pubkey"];
+            if (error || !pubkey) {
+                error ? error.message : JSON.stringify(body);
+                resolve(null);
+            } else resolve(pubkey);
+        });
+    });
+}
+
 async function getConfig() {
+    var lnd_node_pubkey = await getLndNodePubkey();
+    if (!lnd_node_pubkey) return {
+        error: "the seller couldn't read its own LND node key"
+    };
     if (asset_name) return {
         asset_name: asset_name,
         asset_min_amount: asset_min_amount,
         asset_max_amount: asset_max_amount,
         rate_asset_per_btc: rate_asset_per_btc,
         asset_evr_bundle_amount: asset_evr_bundle_amount,
-        rate_evr_per_btc: rate_evr_per_btc
+        rate_evr_per_btc: rate_evr_per_btc,
+        lnd_node_pubkey: lnd_node_pubkey
     };
     return {
         min_amount: min_amount,
         max_amount: max_amount,
-        rate_evr_per_btc: rate_evr_per_btc
+        rate_evr_per_btc: rate_evr_per_btc,
+        lnd_node_pubkey: lnd_node_pubkey
     };
 }
 
@@ -847,12 +950,12 @@ function waitSomeSeconds(num) {
 }
 
 async function howManyConfs(txid, quiet) {
-    var reply = await evrmoreRpc("getrawtransaction", [ txid, true ], quiet);
-    if (reply.result && reply.result["confirmations"]) return reply.result["confirmations"];
+    var answer = await rpcAnswer("getrawtransaction", [ txid, true ], quiet);
+    if (answer.result && answer.result["confirmations"]) return answer.result["confirmations"];
     return "0".toString();
 }
 
-async function waitForOneConfirmation(txid) {
+async function waitForOneConfirmation(txid, invoiceState) {
     var tries = 0;
     while (true) {
         var isFirstTick = tries === 0;
@@ -863,19 +966,24 @@ async function waitForOneConfirmation(txid) {
         }
         tries += 1;
         if (tries >= 30) {
-            await howManyConfs(txid, false);
-            return false;
+            var state = await invoiceState();
+            if (state === "SETTLED") return true;
+            if (state === "CANCELED") {
+                await howManyConfs(txid, false);
+                return false;
+            }
+            if (tries % 30 === 0) ;
         }
         await waitSomeSeconds(60);
     }
 }
 
 async function addressBalanceStatus(address) {
-    var reply = await evrmoreRpc("getaddressbalance", [ {
+    var result = await rpcResult("getaddressbalance", [ {
         addresses: [ address ]
     } ]);
-    var received = !!(reply.result && reply.result["received"] > 0);
-    var spent = !!(reply.result && reply.result["balance"] < reply.result["received"]);
+    var received = !!(result && result["received"] > 0);
+    var spent = !!(result && result["balance"] < result["received"]);
     return {
         received: received,
         spent: spent
@@ -883,10 +991,10 @@ async function addressBalanceStatus(address) {
 }
 
 async function getPreimageFromTransactionThatSpendsAnHTLC(txid, pmthash) {
-    var reply = await evrmoreRpc("getrawtransaction", [ txid, true ]);
-    var json = reply.result;
+    if (!txid) throw new Error("getPreimageFromTransactionThatSpendsAnHTLC: no transaction id");
+    var json = await rpcResult("getrawtransaction", [ txid, true ]);
     var i;
-    for (i = 0; i < json["vin"].length; i++) {
+    for (i = 0; i < (json && json["vin"] || []).length; i++) {
         var scriptsig_hex = json["vin"][i]["scriptSig"] && json["vin"][i]["scriptSig"]["hex"];
         if (!scriptsig_hex) continue;
         var decompiled = evrmorejs.script.decompile(Buffer.from(scriptsig_hex, "hex"));
@@ -900,28 +1008,39 @@ async function getPreimageFromTransactionThatSpendsAnHTLC(txid, pmthash) {
     }
 }
 
-async function findSweepTxidAndPreimage(address, payment_hash) {
-    var idsReply = await evrmoreRpc("getaddresstxids", [ {
+async function findHtlcSpend(address, payment_hash, redeemScriptHex) {
+    var candidateTxids = (await rpcResult("getaddresstxids", [ {
         addresses: [ address ]
-    } ]);
-    var candidateTxids = (idsReply.result || []).map(function(c) {
+    } ]) || []).map(function(c) {
         return c.transactionid || c;
     });
     var i;
     for (i = 0; i < candidateTxids.length; i++) {
+        var tx = await rpcResult("getrawtransaction", [ candidateTxids[i], true ]);
+        var spendsHtlc = (tx && tx["vin"] || []).some(function(input) {
+            var scriptsig_hex = input["scriptSig"] && input["scriptSig"]["hex"];
+            var decompiled = scriptsig_hex && evrmorejs.script.decompile(Buffer.from(scriptsig_hex, "hex"));
+            var last = decompiled && decompiled[decompiled.length - 1];
+            return !!last && typeof last !== "number" && Buffer.from(last).toString("hex") === redeemScriptHex;
+        });
+        if (!spendsHtlc) continue;
         var preimage = await getPreimageFromTransactionThatSpendsAnHTLC(candidateTxids[i], payment_hash);
-        if (preimage) return {
+        return {
             txid: candidateTxids[i],
-            preimage: preimage
+            preimage: preimage || null
         };
     }
     return null;
 }
 
 async function broadcastRawTx(rawtx) {
-    var reply = await evrmoreRpc("sendrawtransaction", [ rawtx ]);
-    if (!reply || !reply.result) var reason = reply && reply.error && (reply.error.error && reply.error.error.message || reply.error.message) || "unknown error";
-    return reply && reply.result;
+    var txid = evrmorejs.Transaction.fromHex(rawtx).getId();
+    var answer = await rpcAnswer("sendrawtransaction", [ rawtx ]);
+    if (!answer.error) return answer.result;
+    var known = await rpcAnswer("getrawtransaction", [ txid ]);
+    if (!known.error) return txid;
+    answer.error.message;
+    return;
 }
 
 async function recoverSats(senderPrivkey, inputtxid, inputindex, fromamount, toaddress, toamount, sequence_number, witnessScriptHex, timelock, assetInput, asset_name, asset_amount) {
@@ -984,7 +1103,7 @@ async function recoverSats(senderPrivkey, inputtxid, inputindex, fromamount, toa
 async function getHodlInvoice(amount, hash, expiry) {
     if (expiry === void 0) expiry = 40;
     var invoice = "";
-    var macaroon = invoicemac;
+    var macaroon = sellermac;
     var endpoint = lndendpoint + "/v2/invoices/hodl";
     let requestBody = {
         hash: Buffer.from(hash, "hex").toString("base64"),
@@ -1032,7 +1151,7 @@ async function getHodlInvoice(amount, hash, expiry) {
 
 async function checkOwnInvoiceStatus(hash) {
     var status;
-    const macaroon = invoicemac;
+    const macaroon = sellermac;
     const endpoint = lndendpoint;
     let options = {
         url: endpoint + "/v1/invoice/" + hash,
@@ -1052,9 +1171,19 @@ async function checkOwnInvoiceStatus(hash) {
     });
 }
 
+async function settleOwnInvoiceUntilDone(preimage, payment_hash) {
+    while (true) {
+        await settleHoldInvoice(preimage);
+        var state = await checkOwnInvoiceStatus(payment_hash);
+        if (state === "SETTLED") return true;
+        if (state === "CANCELED") return false;
+        await waitSomeSeconds(30);
+    }
+}
+
 async function settleHoldInvoice(preimage) {
     var settled = "";
-    const macaroon = invoicemac;
+    const macaroon = sellermac;
     const endpoint = lndendpoint;
     let requestBody = {
         preimage: Buffer.from(preimage, "hex").toString("base64")
@@ -1117,119 +1246,121 @@ async function watchLease(lease_id) {
             activeWatchers.delete(lease_id);
             return;
         }
-        var balanceStatus = await addressBalanceStatus(lease.verified_htlc_address);
-        if (balanceStatus.spent) {
-            var found = await findSweepTxidAndPreimage(lease.verified_htlc_address, lease.payment_hash);
-            if (!found) {
-                resolveLease(lease_id, "spent with no preimage found -- funds conclusively gone regardless of why");
-                activeWatchers.delete(lease_id);
-                return;
-            }
-            var confirmed = await waitForOneConfirmation(found.txid);
-            if (confirmed && !watcherState.cancelled) {
-                if (lease.holdInvoiceAmount) await settleHoldInvoice(found.preimage);
-            } else if (!confirmed) ;
-            resolveLease(lease_id, confirmed ? "sweep confirmed and settled" : "sweep found but never confirmed");
+        if (!leases.has(lease_id)) {
             activeWatchers.delete(lease_id);
             return;
         }
-        var blockheight = await getBlockheight();
-        if (blockheight >= lease.timelock + TIMELOCK_TRIGGER_BUFFER_BLOCKS) {
-            var utxoReply = await evrmoreRpc("getaddressutxos", [ {
-                addresses: [ lease.verified_htlc_address ]
-            } ]);
-            var htlcUtxos = utxoReply.result || [];
-            if (lease.asset_name) {
-                var assetHtlcUtxoReply = await evrmoreRpc("getaddressutxos", [ {
-                    addresses: [ lease.verified_htlc_address ],
-                    assetName: lease.asset_name
-                } ]);
-                htlcUtxos = htlcUtxos.concat(assetHtlcUtxoReply.result || []);
-            }
-            if (!htlcUtxos.length || lease.asset_name && htlcUtxos.length < 2) {
-                tries += 1;
-                if (tries >= 260) {
-                    resolveLease(lease_id, "gave up waiting for HTLC output(s) to become visible -- outcome unknown, manual investigation needed");
-                    activeWatchers.delete(lease_id);
-                    return;
-                }
-                await waitSomeSeconds(30);
-                continue;
-            }
-            var fundingTxid, fundingVout, assetInput;
-            if (lease.asset_name) {
-                var classified = [];
-                var hu;
-                for (hu = 0; hu < htlcUtxos.length; hu++) {
-                    var cand = htlcUtxos[hu];
-                    var cTxid = cand.tx_hash || cand.txid;
-                    var cVout = cand.tx_pos !== void 0 ? cand.tx_pos : cand.outputIndex;
-                    var script;
-                    if (cand.script) script = Buffer.from(cand.script, "hex"); else {
-                        var rawCandTx = await getRawTxHex(cTxid);
-                        script = evrmorejs.Transaction.fromHex(rawCandTx).outs[cVout].script;
-                    }
-                    classified.push({
-                        txid: cTxid,
-                        vout: cVout,
-                        isAsset: outputHasAssetTail(script)
-                    });
-                }
-                var assetLeg = classified.filter(function(c) {
-                    return c.isAsset;
-                });
-                var evrLeg = classified.filter(function(c) {
-                    return !c.isAsset;
-                });
-                if (assetLeg.length !== 1 || evrLeg.length !== 1) {
-                    assetLeg.length, evrLeg.length;
-                    tries += 1;
-                    if (tries >= 260) {
-                        resolveLease(lease_id, "gave up waiting for HTLC leg classification to resolve -- outcome unknown, manual investigation needed");
-                        activeWatchers.delete(lease_id);
-                        return;
-                    }
+        try {
+            var balanceStatus = await addressBalanceStatus(lease.verified_htlc_address);
+            if (balanceStatus.spent) {
+                var redeemScriptHex = Buffer.from(generateHtlc(lease.refund_pubkey, lease.buyer_pubkey, lease.payment_hash, lease.timelock)).toString("hex");
+                var found = await findHtlcSpend(lease.verified_htlc_address, lease.payment_hash, redeemScriptHex);
+                if (!found) {
                     await waitSomeSeconds(30);
                     continue;
                 }
-                fundingTxid = evrLeg[0].txid;
-                fundingVout = evrLeg[0].vout;
-                assetInput = {
-                    txid: assetLeg[0].txid,
-                    vout: assetLeg[0].vout
-                };
-            } else {
-                var fundingUtxo = htlcUtxos[0];
-                fundingTxid = fundingUtxo.tx_hash || fundingUtxo.txid;
-                fundingVout = fundingUtxo.tx_pos !== void 0 ? fundingUtxo.tx_pos : fundingUtxo.outputIndex;
-            }
-            if (lease.refund_key_counter === void 0 || lease.refund_key_counter === null) {
-                lease.refund_pubkey;
+                if (!found.preimage) {
+                    found.txid;
+                    resolveLease(lease_id, "spent with no preimage found -- funds conclusively gone regardless of why");
+                    activeWatchers.delete(lease_id);
+                    return;
+                }
+                var confirmed = await waitForOneConfirmation(found.txid, function() {
+                    return checkOwnInvoiceStatus(lease.payment_hash);
+                });
+                var settledOk = false;
+                if (confirmed && !watcherState.cancelled) {
+                    if (lease.holdInvoiceAmount) settledOk = await settleOwnInvoiceUntilDone(found.preimage, lease.payment_hash);
+                } else if (!confirmed) ;
+                resolveLease(lease_id, !confirmed ? "sweep found, but the compensation invoice was cancelled/expired before it confirmed" : settledOk ? "sweep confirmed and settled" : "sweep confirmed, but the compensation invoice was cancelled/expired before it could be settled -- not paid");
                 activeWatchers.delete(lease_id);
                 return;
             }
-            var refundKeyEntry = {
-                privkey: deriveRefundPrivkeyHex(lease.refund_key_counter)
-            };
-            var witnessScriptHex = Buffer.from(generateHtlc(lease.refund_pubkey, lease.buyer_pubkey, lease.payment_hash, lease.timelock)).toString("hex");
-            var refund_feerate = await getMinFeeRate();
-            var refund_fee = (lease.asset_name ? 350 + 150 + 34 + ASSET_TAIL_MAX_BYTES : 350) * Number(refund_feerate);
-            var recovery_tx = await recoverSats(refundKeyEntry.privkey, fundingTxid, fundingVout, lease.amount, sellerAddress, lease.amount - refund_fee, 4294967294, witnessScriptHex, lease.timelock, assetInput, lease.asset_name, lease.asset_amount);
-            await broadcastRawTx(recovery_tx);
-            if (lease.holdInvoiceAmount) await cancelHoldInvoice({
-                payment_hash: lease.payment_hash
-            });
-            resolveLease(lease_id, "refund transaction broadcast");
-            activeWatchers.delete(lease_id);
-            return;
+            var blockheight = await getBlockheight();
+            if (blockheight >= lease.timelock + TIMELOCK_TRIGGER_BUFFER_BLOCKS) {
+                var htlcUtxos = await rpcResult("getaddressutxos", [ {
+                    addresses: [ lease.verified_htlc_address ]
+                } ]) || [];
+                if (lease.asset_name) htlcUtxos = htlcUtxos.concat(await rpcResult("getaddressutxos", [ {
+                    addresses: [ lease.verified_htlc_address ],
+                    assetName: lease.asset_name
+                } ]) || []);
+                if (!htlcUtxos.length || lease.asset_name && htlcUtxos.length < 2) {
+                    tries += 1;
+                    if (tries % 120 === 0) ;
+                    await waitSomeSeconds(30);
+                    continue;
+                }
+                var fundingTxid, fundingVout, assetInput;
+                if (lease.asset_name) {
+                    var classified = [];
+                    var hu;
+                    for (hu = 0; hu < htlcUtxos.length; hu++) {
+                        var cand = htlcUtxos[hu];
+                        var cTxid = cand.tx_hash || cand.txid;
+                        var cVout = cand.tx_pos !== void 0 ? cand.tx_pos : cand.outputIndex;
+                        var script;
+                        if (cand.script) script = Buffer.from(cand.script, "hex"); else {
+                            var rawCandTx = await getRawTxHex(cTxid);
+                            script = evrmorejs.Transaction.fromHex(rawCandTx).outs[cVout].script;
+                        }
+                        classified.push({
+                            txid: cTxid,
+                            vout: cVout,
+                            isAsset: outputHasAssetTail(script)
+                        });
+                    }
+                    var assetLeg = classified.filter(function(c) {
+                        return c.isAsset;
+                    });
+                    var evrLeg = classified.filter(function(c) {
+                        return !c.isAsset;
+                    });
+                    if (assetLeg.length !== 1 || evrLeg.length !== 1) {
+                        assetLeg.length, evrLeg.length;
+                        await waitSomeSeconds(30);
+                        continue;
+                    }
+                    fundingTxid = evrLeg[0].txid;
+                    fundingVout = evrLeg[0].vout;
+                    assetInput = {
+                        txid: assetLeg[0].txid,
+                        vout: assetLeg[0].vout
+                    };
+                } else {
+                    var fundingUtxo = htlcUtxos[0];
+                    fundingTxid = fundingUtxo.tx_hash || fundingUtxo.txid;
+                    fundingVout = fundingUtxo.tx_pos !== void 0 ? fundingUtxo.tx_pos : fundingUtxo.outputIndex;
+                }
+                if (lease.refund_key_counter === void 0 || lease.refund_key_counter === null) {
+                    lease.refund_pubkey;
+                    activeWatchers.delete(lease_id);
+                    return;
+                }
+                var refundKeyEntry = {
+                    privkey: deriveRefundPrivkeyHex(lease.refund_key_counter)
+                };
+                var witnessScriptHex = Buffer.from(generateHtlc(lease.refund_pubkey, lease.buyer_pubkey, lease.payment_hash, lease.timelock)).toString("hex");
+                var refund_feerate = await getMinFeeRate();
+                var refund_fee = (lease.asset_name ? 350 + 150 + 34 + ASSET_TAIL_MAX_BYTES : 350) * Number(refund_feerate);
+                var recovery_tx = await recoverSats(refundKeyEntry.privkey, fundingTxid, fundingVout, lease.amount, sellerAddress, lease.amount - refund_fee, 4294967294, witnessScriptHex, lease.timelock, assetInput, lease.asset_name, lease.asset_amount);
+                var refundTxid = await broadcastRawTx(recovery_tx);
+                if (!refundTxid) {
+                    await waitSomeSeconds(30);
+                    continue;
+                }
+                if (lease.holdInvoiceAmount) await cancelHoldInvoice({
+                    payment_hash: lease.payment_hash
+                });
+                resolveLease(lease_id, "refund transaction broadcast");
+                activeWatchers.delete(lease_id);
+                return;
+            }
+            await waitSomeSeconds(30);
+        } catch (e) {
+            e.message;
+            await waitSomeSeconds(30);
         }
-        tries += 1;
-        if (tries >= 260) {
-            resolveLease(lease_id, "gave up watching -- timelock never appeared to arrive, outcome unknown, manual investigation needed");
-            activeWatchers.delete(lease_id);
-            return;
-        }
-        await waitSomeSeconds(30);
     }
 }
 
@@ -1241,7 +1372,12 @@ async function makeHoldInvoice(req) {
     if (lease.payment_hash !== req.payment_hash) return {
         error: "payment_hash does not match the lease's own payment_hash"
     };
-    var invoice = await getHodlInvoice(req.amount, req.payment_hash, req.expiry);
+    var expectedLsats = expectedCompensationLsats(lease);
+    if (!(Number(req.amount) >= expectedLsats - COMPENSATION_ROUNDING_TOLERANCE_LSATS)) return {
+        error: "compensation of " + req.amount + " L-sats is below this seller's price for the lease (" + expectedLsats + " L-sats)"
+    };
+    var cltvExpiry = Math.max(Number(req.expiry) || 0, MIN_COMPENSATION_INVOICE_CLTV);
+    var invoice = await getHodlInvoice(req.amount, req.payment_hash, cltvExpiry);
     if (!invoice) return {
         error: "failed to create hold invoice"
     };
@@ -1253,9 +1389,24 @@ async function makeHoldInvoice(req) {
         payment_hash: req.payment_hash,
         amount: Number(req.amount),
         created_at: created_at,
-        expires_at: created_at + (req.expiry || 40) * 60,
+        expires_at: created_at + cltvExpiry * 600,
         type: "incoming"
     };
+}
+
+async function cancelHoldInvoiceRpc(req) {
+    var matching = Array.from(leases.values()).filter(function(lease) {
+        return lease.payment_hash === req.payment_hash;
+    });
+    if (!matching.length) return {
+        error: "no lease with this payment hash"
+    };
+    if (matching.some(function(lease) {
+        return lease.state !== "leased";
+    })) return {
+        error: "this lease's funding is already signed -- its compensation invoice can't be cancelled on request"
+    };
+    return cancelHoldInvoice(req);
 }
 
 async function cancelHoldInvoice(req) {
@@ -1266,7 +1417,7 @@ async function cancelHoldInvoice(req) {
         if (watcherState) watcherState.cancelled = true;
     }
     var done = "";
-    const macaroon = invoicemac;
+    const macaroon = sellermac;
     const endpoint = lndendpoint;
     let requestBody = {
         payment_hash: Buffer.from(pmthash, "hex").toString("base64")
@@ -1539,6 +1690,7 @@ function isValidJson(content) {
 }
 
 function isHex(h) {
+    if (typeof h !== "string" || !/^[0-9a-fA-F]*$/.test(h)) return false;
     var length = h.length;
     if (length % 2) return;
     if (length > 66) return;
@@ -1717,7 +1869,7 @@ var rpcMethods = {
     sign_psbt: signPsbt,
     get_config: getConfig,
     make_hold_invoice: makeHoldInvoice,
-    cancel_hold_invoice: cancelHoldInvoice,
+    cancel_hold_invoice: cancelHoldInvoiceRpc,
     has_sufficient_balance: hasSufficientBalance
 };
 
